@@ -133,6 +133,9 @@ def arguments(func: FunctionType, indent: int) -> str:
         value_str = str(value)
         if name == "return":
             continue
+        assert (
+            "_" not in name
+        ), f"Underscore in impl classes is not allowed, use camel case, func={func}, name={name}"
         if "Callable" in value_str:
             tokens.append(f"{name}=self._wrap_handler({to_snake_case(name)})")
         elif (
@@ -208,13 +211,9 @@ header = """
 
 
 import typing
-import sys
 import pathlib
 
-if sys.version_info >= (3, 8):  # pragma: no cover
-    from typing import Literal
-else:  # pragma: no cover
-    from typing_extensions import Literal
+from typing import Literal
 
 
 from playwright._impl._accessibility import Accessibility as AccessibilityImpl

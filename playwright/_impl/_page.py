@@ -25,6 +25,7 @@ from typing import (
     Callable,
     Dict,
     List,
+    Literal,
     Optional,
     Pattern,
     Sequence,
@@ -54,6 +55,7 @@ from playwright._impl._errors import Error, TargetClosedError, is_target_closed_
 from playwright._impl._event_context_manager import EventContextManagerImpl
 from playwright._impl._file_chooser import FileChooser
 from playwright._impl._frame import Frame
+from playwright._impl._greenlets import LocatorHandlerGreenlet
 from playwright._impl._har_router import HarRouter
 from playwright._impl._helper import (
     ColorScheme,
@@ -81,6 +83,7 @@ from playwright._impl._input import Keyboard, Mouse, Touchscreen
 from playwright._impl._js_handle import (
     JSHandle,
     Serializable,
+    add_source_url_to_script,
     parse_result,
     serialize_argument,
 )
@@ -88,16 +91,30 @@ from playwright._impl._network import Request, Response, Route, serialize_header
 from playwright._impl._video import Video
 from playwright._impl._waiter import Waiter
 
-if sys.version_info >= (3, 8):  # pragma: no cover
-    from typing import Literal
-else:  # pragma: no cover
-    from typing_extensions import Literal
-
 if TYPE_CHECKING:  # pragma: no cover
     from playwright._impl._browser_context import BrowserContext
     from playwright._impl._fetch import APIRequestContext
     from playwright._impl._locator import FrameLocator, Locator
     from playwright._impl._network import WebSocket
+
+
+class LocatorHandler:
+    locator: "Locator"
+    handler: Union[Callable[["Locator"], Any], Callable[..., Any]]
+    times: Union[int, None]
+
+    def __init__(
+        self, locator: "Locator", handler: Callable[..., Any], times: Union[int, None]
+    ) -> None:
+        self.locator = locator
+        self._handler = handler
+        self.times = times
+
+    def __call__(self) -> Any:
+        arg_count = len(inspect.signature(self._handler).parameters)
+        if arg_count == 0:
+            return self._handler()
+        return self._handler(self.locator)
 
 
 class Page(ChannelOwner):
@@ -152,6 +169,9 @@ class Page(ChannelOwner):
         self._video: Optional[Video] = None
         self._opener = cast("Page", from_nullable_channel(initializer.get("opener")))
         self._close_reason: Optional[str] = None
+        self._close_was_called = False
+        self._har_routers: List[HarRouter] = []
+        self._locator_handlers: Dict[str, LocatorHandler] = {}
 
         self._channel.on(
             "bindingCall",
@@ -178,8 +198,14 @@ class Page(ChannelOwner):
             lambda params: self._on_frame_detached(from_channel(params["frame"])),
         )
         self._channel.on(
+            "locatorHandlerTriggered",
+            lambda params: self._loop.create_task(
+                self._on_locator_handler_triggered(params["uid"])
+            ),
+        )
+        self._channel.on(
             "route",
-            lambda params: asyncio.create_task(
+            lambda params: self._loop.create_task(
                 self._on_route(from_channel(params["route"]))
             ),
         )
@@ -196,17 +222,21 @@ class Page(ChannelOwner):
         self._closed_or_crashed_future: asyncio.Future = asyncio.Future()
         self.on(
             Page.Events.Close,
-            lambda _: self._closed_or_crashed_future.set_result(
-                self._close_error_with_reason()
-            )
-            if not self._closed_or_crashed_future.done()
-            else None,
+            lambda _: (
+                self._closed_or_crashed_future.set_result(
+                    self._close_error_with_reason()
+                )
+                if not self._closed_or_crashed_future.done()
+                else None
+            ),
         )
         self.on(
             Page.Events.Crash,
-            lambda _: self._closed_or_crashed_future.set_result(TargetClosedError())
-            if not self._closed_or_crashed_future.done()
-            else None,
+            lambda _: (
+                self._closed_or_crashed_future.set_result(TargetClosedError())
+                if not self._closed_or_crashed_future.done()
+                else None
+            ),
         )
 
         self._set_event_to_subscription_mapping(
@@ -238,7 +268,12 @@ class Page(ChannelOwner):
         route._context = self.context
         route_handlers = self._routes.copy()
         for route_handler in route_handlers:
+            # If the page was closed we stall all requests right away.
+            if self._close_was_called or self.context._close_was_called:
+                return
             if not route_handler.matches(route.request.url):
+                continue
+            if route_handler not in self._routes:
                 continue
             if route_handler.will_expire:
                 self._routes.remove(route_handler)
@@ -246,9 +281,16 @@ class Page(ChannelOwner):
                 handled = await route_handler.handle(route)
             finally:
                 if len(self._routes) == 0:
+
+                    async def _update_interceptor_patterns_ignore_exceptions() -> None:
+                        try:
+                            await self._update_interception_patterns()
+                        except Error:
+                            pass
+
                     asyncio.create_task(
                         self._connection.wrap_api_call(
-                            lambda: self._update_interception_patterns(), True
+                            _update_interceptor_patterns_ignore_exceptions, True
                         )
                     )
             if handled:
@@ -272,6 +314,7 @@ class Page(ChannelOwner):
             self._browser_context._pages.remove(self)
         if self in self._browser_context._background_pages:
             self._browser_context._background_pages.remove(self)
+        self._dispose_har_routers()
         self.emit(Page.Events.Close, self)
 
     def _on_crash(self) -> None:
@@ -287,7 +330,7 @@ class Page(ChannelOwner):
 
     def _on_video(self, params: Any) -> None:
         artifact = from_channel(params["artifact"])
-        cast(Video, self.video)._artifact_ready(artifact)
+        self._force_video()._artifact_ready(artifact)
 
     @property
     def context(self) -> "BrowserContext":
@@ -494,7 +537,7 @@ class Page(ChannelOwner):
     async def wait_for_url(
         self,
         url: URLMatch,
-        wait_until: DocumentLoadState = None,
+        waitUntil: DocumentLoadState = None,
         timeout: float = None,
     ) -> None:
         return await self._main_frame.wait_for_url(**locals_to_params(locals()))
@@ -563,7 +606,9 @@ class Page(ChannelOwner):
         self, script: str = None, path: Union[str, Path] = None
     ) -> None:
         if path:
-            script = (await async_readfile(path)).decode()
+            script = add_source_url_to_script(
+                (await async_readfile(path)).decode(), path
+            )
         if not isinstance(script, str):
             raise Error("Either path or script parameter must be specified")
         await self._channel.send("addInitScript", dict(source=script))
@@ -585,38 +630,68 @@ class Page(ChannelOwner):
     async def unroute(
         self, url: URLMatch, handler: Optional[RouteHandlerCallback] = None
     ) -> None:
-        self._routes = list(
-            filter(
-                lambda r: r.matcher.match != url or (handler and r.handler != handler),
-                self._routes,
+        removed = []
+        remaining = []
+        for route in self._routes:
+            if route.matcher.match != url or (handler and route.handler != handler):
+                remaining.append(route)
+            else:
+                removed.append(route)
+        await self._unroute_internal(removed, remaining, "default")
+
+    async def _unroute_internal(
+        self,
+        removed: List[RouteHandler],
+        remaining: List[RouteHandler],
+        behavior: Literal["default", "ignoreErrors", "wait"] = None,
+    ) -> None:
+        self._routes = remaining
+        await self._update_interception_patterns()
+        if behavior is None or behavior == "default":
+            return
+        await asyncio.gather(
+            *map(
+                lambda route: route.stop(behavior),  # type: ignore
+                removed,
             )
         )
-        await self._update_interception_patterns()
+
+    def _dispose_har_routers(self) -> None:
+        for router in self._har_routers:
+            router.dispose()
+        self._har_routers = []
+
+    async def unroute_all(
+        self, behavior: Literal["default", "ignoreErrors", "wait"] = None
+    ) -> None:
+        await self._unroute_internal(self._routes, [], behavior)
+        self._dispose_har_routers()
 
     async def route_from_har(
         self,
         har: Union[Path, str],
         url: Union[Pattern[str], str] = None,
-        not_found: RouteFromHarNotFoundPolicy = None,
+        notFound: RouteFromHarNotFoundPolicy = None,
         update: bool = None,
-        update_content: Literal["attach", "embed"] = None,
-        update_mode: HarMode = None,
+        updateContent: Literal["attach", "embed"] = None,
+        updateMode: HarMode = None,
     ) -> None:
         if update:
             await self._browser_context._record_into_har(
                 har=har,
                 page=self,
                 url=url,
-                update_content=update_content,
-                update_mode=update_mode,
+                update_content=updateContent,
+                update_mode=updateMode,
             )
             return
         router = await HarRouter.create(
             local_utils=self._connection.local_utils,
             file=str(har),
-            not_found_action=not_found or "abort",
+            not_found_action=notFound or "abort",
             url_matcher=url,
         )
+        self._har_routers.append(router)
         await router.add_page_route(self)
 
     async def _update_interception_patterns(self) -> None:
@@ -638,7 +713,8 @@ class Page(ChannelOwner):
         caret: Literal["hide", "initial"] = None,
         scale: Literal["css", "device"] = None,
         mask: Sequence["Locator"] = None,
-        mask_color: str = None,
+        maskColor: str = None,
+        style: str = None,
     ) -> bytes:
         params = locals_to_params(locals())
         if "path" in params:
@@ -667,6 +743,7 @@ class Page(ChannelOwner):
 
     async def close(self, runBeforeUnload: bool = None, reason: str = None) -> None:
         self._close_reason = reason
+        self._close_was_called = True
         try:
             await self._channel.send("close", locals_to_params(locals()))
             if self._owned_context:
@@ -736,17 +813,17 @@ class Page(ChannelOwner):
     def locator(
         self,
         selector: str,
-        has_text: Union[str, Pattern[str]] = None,
-        has_not_text: Union[str, Pattern[str]] = None,
+        hasText: Union[str, Pattern[str]] = None,
+        hasNotText: Union[str, Pattern[str]] = None,
         has: "Locator" = None,
-        has_not: "Locator" = None,
+        hasNot: "Locator" = None,
     ) -> "Locator":
         return self._main_frame.locator(
             selector,
-            has_text=has_text,
-            has_not_text=has_not_text,
+            hasText=hasText,
+            hasNotText=hasNotText,
             has=has,
-            has_not=has_not,
+            hasNot=hasNot,
         )
 
     def get_by_alt_text(
@@ -993,6 +1070,8 @@ class Page(ChannelOwner):
         preferCSSPageSize: bool = None,
         margin: PdfMargins = None,
         path: Union[str, Path] = None,
+        outline: bool = None,
+        tagged: bool = None,
     ) -> bytes:
         params = locals_to_params(locals())
         if "path" in params:
@@ -1004,13 +1083,21 @@ class Page(ChannelOwner):
             await async_writefile(path, decoded_binary)
         return decoded_binary
 
+    def _force_video(self) -> Video:
+        if not self._video:
+            self._video = Video(self)
+        return self._video
+
     @property
     def video(
         self,
     ) -> Optional[Video]:
-        if not self._video:
-            self._video = Video(self)
-        return self._video
+        # Note: we are creating Video object lazily, because we do not know
+        # BrowserContextOptions when constructing the page - it is assigned
+        # too late during launchPersistentContext.
+        if not self._browser_context._options.get("recordVideo"):
+            return None
+        return self._force_video()
 
     def _close_error_with_reason(self) -> TargetClosedError:
         return TargetClosedError(
@@ -1075,10 +1162,10 @@ class Page(ChannelOwner):
     def expect_navigation(
         self,
         url: URLMatch = None,
-        wait_until: DocumentLoadState = None,
+        waitUntil: DocumentLoadState = None,
         timeout: float = None,
     ) -> EventContextManagerImpl[Response]:
-        return self.main_frame.expect_navigation(url, wait_until, timeout)
+        return self.main_frame.expect_navigation(url, waitUntil, timeout)
 
     def expect_popup(
         self,
@@ -1089,17 +1176,17 @@ class Page(ChannelOwner):
 
     def expect_request(
         self,
-        url_or_predicate: URLMatchRequest,
+        urlOrPredicate: URLMatchRequest,
         timeout: float = None,
     ) -> EventContextManagerImpl[Request]:
         matcher = (
             None
-            if callable(url_or_predicate)
+            if callable(urlOrPredicate)
             else URLMatcher(
-                self._browser_context._options.get("baseURL"), url_or_predicate
+                self._browser_context._options.get("baseURL"), urlOrPredicate
             )
         )
-        predicate = url_or_predicate if callable(url_or_predicate) else None
+        predicate = urlOrPredicate if callable(urlOrPredicate) else None
 
         def my_predicate(request: Request) -> bool:
             if matcher:
@@ -1108,7 +1195,7 @@ class Page(ChannelOwner):
                 return predicate(request)
             return True
 
-        trimmed_url = trim_url(url_or_predicate)
+        trimmed_url = trim_url(urlOrPredicate)
         log_line = f"waiting for request {trimmed_url}" if trimmed_url else None
         return self._expect_event(
             Page.Events.Request,
@@ -1128,17 +1215,17 @@ class Page(ChannelOwner):
 
     def expect_response(
         self,
-        url_or_predicate: URLMatchResponse,
+        urlOrPredicate: URLMatchResponse,
         timeout: float = None,
     ) -> EventContextManagerImpl[Response]:
         matcher = (
             None
-            if callable(url_or_predicate)
+            if callable(urlOrPredicate)
             else URLMatcher(
-                self._browser_context._options.get("baseURL"), url_or_predicate
+                self._browser_context._options.get("baseURL"), urlOrPredicate
             )
         )
-        predicate = url_or_predicate if callable(url_or_predicate) else None
+        predicate = urlOrPredicate if callable(urlOrPredicate) else None
 
         def my_predicate(response: Response) -> bool:
             if matcher:
@@ -1147,7 +1234,7 @@ class Page(ChannelOwner):
                 return predicate(response)
             return True
 
-        trimmed_url = trim_url(url_or_predicate)
+        trimmed_url = trim_url(urlOrPredicate)
         log_line = f"waiting for response {trimmed_url}" if trimmed_url else None
         return self._expect_event(
             Page.Events.Response,
@@ -1201,6 +1288,72 @@ class Page(ChannelOwner):
                 strict=strict,
                 trial=trial,
             )
+
+    async def add_locator_handler(
+        self,
+        locator: "Locator",
+        handler: Union[Callable[["Locator"], Any], Callable[[], Any]],
+        noWaitAfter: bool = None,
+        times: int = None,
+    ) -> None:
+        if locator._frame != self._main_frame:
+            raise Error("Locator must belong to the main frame of this page")
+        if times == 0:
+            return
+        uid = await self._channel.send(
+            "registerLocatorHandler",
+            {
+                "selector": locator._selector,
+                "noWaitAfter": noWaitAfter,
+            },
+        )
+        self._locator_handlers[uid] = LocatorHandler(
+            handler=handler, times=times, locator=locator
+        )
+
+    async def _on_locator_handler_triggered(self, uid: str) -> None:
+        remove = False
+        try:
+            handler = self._locator_handlers.get(uid)
+            if handler and handler.times != 0:
+                if handler.times is not None:
+                    handler.times -= 1
+                if self._dispatcher_fiber:
+                    handler_finished_future = self._loop.create_future()
+
+                    def _handler() -> None:
+                        try:
+                            handler()
+                            handler_finished_future.set_result(None)
+                        except Exception as e:
+                            handler_finished_future.set_exception(e)
+
+                    g = LocatorHandlerGreenlet(_handler)
+                    g.switch()
+                    await handler_finished_future
+                else:
+                    coro_or_future = handler()
+                    if coro_or_future:
+                        await coro_or_future
+                remove = handler.times == 0
+        finally:
+            if remove:
+                del self._locator_handlers[uid]
+            try:
+                await self._connection.wrap_api_call(
+                    lambda: self._channel.send(
+                        "resolveLocatorHandlerNoReply", {"uid": uid, "remove": remove}
+                    ),
+                    is_internal=True,
+                )
+            except Error:
+                pass
+
+    async def remove_locator_handler(self, locator: "Locator") -> None:
+        for uid, data in self._locator_handlers.copy().items():
+            if data.locator._equals(locator):
+                del self._locator_handlers[uid]
+                self._channel.send_no_reply("unregisterLocatorHandler", {"uid": uid})
 
 
 class Worker(ChannelOwner):

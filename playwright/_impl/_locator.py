@@ -14,7 +14,6 @@
 
 import json
 import pathlib
-import sys
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -22,6 +21,7 @@ from typing import (
     Callable,
     Dict,
     List,
+    Literal,
     Optional,
     Pattern,
     Sequence,
@@ -52,11 +52,6 @@ from playwright._impl._str_utils import (
     escape_for_attribute_selector,
     escape_for_text_selector,
 )
-
-if sys.version_info >= (3, 8):  # pragma: no cover
-    from typing import Literal
-else:  # pragma: no cover
-    from typing_extensions import Literal
 
 if TYPE_CHECKING:  # pragma: no cover
     from playwright._impl._frame import Frame
@@ -120,6 +115,9 @@ class Locator:
             )
         finally:
             await handle.dispose()
+
+    def _equals(self, locator: "Locator") -> bool:
+        return self._frame == locator._frame and self._selector == locator._selector
 
     @property
     def page(self) -> "Page":
@@ -219,30 +217,30 @@ class Locator:
 
     def locator(
         self,
-        selector_or_locator: Union[str, "Locator"],
-        has_text: Union[str, Pattern[str]] = None,
-        has_not_text: Union[str, Pattern[str]] = None,
+        selectorOrLocator: Union[str, "Locator"],
+        hasText: Union[str, Pattern[str]] = None,
+        hasNotText: Union[str, Pattern[str]] = None,
         has: "Locator" = None,
-        has_not: "Locator" = None,
+        hasNot: "Locator" = None,
     ) -> "Locator":
-        if isinstance(selector_or_locator, str):
+        if isinstance(selectorOrLocator, str):
             return Locator(
                 self._frame,
-                f"{self._selector} >> {selector_or_locator}",
-                has_text=has_text,
-                has_not_text=has_not_text,
-                has_not=has_not,
+                f"{self._selector} >> {selectorOrLocator}",
+                has_text=hasText,
+                has_not_text=hasNotText,
+                has_not=hasNot,
                 has=has,
             )
-        selector_or_locator = to_impl(selector_or_locator)
-        if selector_or_locator._frame != self._frame:
+        selectorOrLocator = to_impl(selectorOrLocator)
+        if selectorOrLocator._frame != self._frame:
             raise Error("Locators must belong to the same frame.")
         return Locator(
             self._frame,
-            f"{self._selector} >> internal:chain={json.dumps(selector_or_locator._selector)}",
-            has_text=has_text,
-            has_not_text=has_not_text,
-            has_not=has_not,
+            f"{self._selector} >> internal:chain={json.dumps(selectorOrLocator._selector)}",
+            has_text=hasText,
+            has_not_text=hasNotText,
+            has_not=hasNot,
             has=has,
         )
 
@@ -330,20 +328,24 @@ class Locator:
     def nth(self, index: int) -> "Locator":
         return Locator(self._frame, f"{self._selector} >> nth={index}")
 
+    @property
+    def content_frame(self) -> "FrameLocator":
+        return FrameLocator(self._frame, self._selector)
+
     def filter(
         self,
-        has_text: Union[str, Pattern[str]] = None,
-        has_not_text: Union[str, Pattern[str]] = None,
+        hasText: Union[str, Pattern[str]] = None,
+        hasNotText: Union[str, Pattern[str]] = None,
         has: "Locator" = None,
-        has_not: "Locator" = None,
+        hasNot: "Locator" = None,
     ) -> "Locator":
         return Locator(
             self._frame,
             self._selector,
-            has_text=has_text,
-            has_not_text=has_not_text,
+            has_text=hasText,
+            has_not_text=hasNotText,
             has=has,
-            has_not=has_not,
+            has_not=hasNot,
         )
 
     def or_(self, locator: "Locator") -> "Locator":
@@ -522,7 +524,8 @@ class Locator:
         caret: Literal["hide", "initial"] = None,
         scale: Literal["css", "device"] = None,
         mask: Sequence["Locator"] = None,
-        mask_color: str = None,
+        maskColor: str = None,
+        style: str = None,
     ) -> bytes:
         params = locals_to_params(locals())
         return await self._with_element(
@@ -724,31 +727,31 @@ class FrameLocator:
 
     def locator(
         self,
-        selector_or_locator: Union["Locator", str],
-        has_text: Union[str, Pattern[str]] = None,
-        has_not_text: Union[str, Pattern[str]] = None,
-        has: "Locator" = None,
-        has_not: "Locator" = None,
+        selectorOrLocator: Union["Locator", str],
+        hasText: Union[str, Pattern[str]] = None,
+        hasNotText: Union[str, Pattern[str]] = None,
+        has: Locator = None,
+        hasNot: Locator = None,
     ) -> Locator:
-        if isinstance(selector_or_locator, str):
+        if isinstance(selectorOrLocator, str):
             return Locator(
                 self._frame,
-                f"{self._frame_selector} >> internal:control=enter-frame >> {selector_or_locator}",
-                has_text=has_text,
-                has_not_text=has_not_text,
+                f"{self._frame_selector} >> internal:control=enter-frame >> {selectorOrLocator}",
+                has_text=hasText,
+                has_not_text=hasNotText,
                 has=has,
-                has_not=has_not,
+                has_not=hasNot,
             )
-        selector_or_locator = to_impl(selector_or_locator)
-        if selector_or_locator._frame != self._frame:
+        selectorOrLocator = to_impl(selectorOrLocator)
+        if selectorOrLocator._frame != self._frame:
             raise ValueError("Locators must belong to the same frame.")
         return Locator(
             self._frame,
-            f"{self._frame_selector} >> internal:control=enter-frame >> {selector_or_locator._selector}",
-            has_text=has_text,
-            has_not_text=has_not_text,
+            f"{self._frame_selector} >> internal:control=enter-frame >> {selectorOrLocator._selector}",
+            has_text=hasText,
+            has_not_text=hasNotText,
             has=has,
-            has_not=has_not,
+            has_not=hasNot,
         )
 
     def get_by_alt_text(
@@ -820,6 +823,10 @@ class FrameLocator:
     @property
     def last(self) -> "FrameLocator":
         return FrameLocator(self._frame, f"{self._frame_selector} >> nth=-1")
+
+    @property
+    def owner(self) -> "Locator":
+        return Locator(self._frame, self._frame_selector)
 
     def nth(self, index: int) -> "FrameLocator":
         return FrameLocator(self._frame, f"{self._frame_selector} >> nth={index}")

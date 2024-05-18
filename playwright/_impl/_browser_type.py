@@ -163,7 +163,7 @@ class BrowserType(ChannelOwner):
         self,
         endpointURL: str,
         timeout: float = None,
-        slow_mo: float = None,
+        slowMo: float = None,
         headers: Dict[str, str] = None,
     ) -> Browser:
         params = locals_to_params(locals())
@@ -183,16 +183,16 @@ class BrowserType(ChannelOwner):
 
     async def connect(
         self,
-        ws_endpoint: str,
+        wsEndpoint: str,
         timeout: float = None,
-        slow_mo: float = None,
+        slowMo: float = None,
         headers: Dict[str, str] = None,
-        expose_network: str = None,
+        exposeNetwork: str = None,
     ) -> Browser:
         if timeout is None:
             timeout = 30000
-        if slow_mo is None:
-            slow_mo = 0
+        if slowMo is None:
+            slowMo = 0
 
         headers = {**(headers if headers else {}), "x-playwright-browser": self.name}
         local_utils = self._connection.local_utils
@@ -200,11 +200,11 @@ class BrowserType(ChannelOwner):
             await local_utils._channel.send_return_as_dict(
                 "connect",
                 {
-                    "wsEndpoint": ws_endpoint,
+                    "wsEndpoint": wsEndpoint,
                     "headers": headers,
-                    "slowMo": slow_mo,
+                    "slowMo": slowMo,
                     "timeout": timeout,
-                    "exposeNetwork": expose_network,
+                    "exposeNetwork": exposeNetwork,
                 },
             )
         )["pipe"]
@@ -218,6 +218,20 @@ class BrowserType(ChannelOwner):
             local_utils=self._connection.local_utils,
         )
         connection.mark_as_remote()
+
+        browser = None
+
+        def handle_transport_close(reason: Optional[str]) -> None:
+            if browser:
+                for context in browser.contexts:
+                    for page in context.pages:
+                        page._on_close()
+                    context._on_close()
+                browser._on_close()
+            connection.cleanup(reason)
+
+        transport.once("close", handle_transport_close)
+
         connection._is_sync = self._connection._is_sync
         connection._loop.create_task(connection.run())
         playwright_future = connection.playwright_future
@@ -239,16 +253,6 @@ class BrowserType(ChannelOwner):
         browser = cast(Browser, from_channel(pre_launched_browser))
         self._did_launch_browser(browser)
         browser._should_close_connection_on_close = True
-
-        def handle_transport_close() -> None:
-            for context in browser.contexts:
-                for page in context.pages:
-                    page._on_close()
-                context._on_close()
-            browser._on_close()
-            connection.cleanup()
-
-        transport.once("close", handle_transport_close)
 
         return browser
 
