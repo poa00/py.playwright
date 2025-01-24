@@ -15,9 +15,10 @@
 import asyncio
 import pathlib
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, Optional, Pattern, Sequence, Union, cast
+from typing import TYPE_CHECKING, Dict, List, Optional, Pattern, Sequence, Union, cast
 
 from playwright._impl._api_structures import (
+    ClientCertificate,
     Geolocation,
     HttpCredentials,
     ProxySettings,
@@ -147,6 +148,7 @@ class BrowserType(ChannelOwner):
         recordHarUrlFilter: Union[Pattern[str], str] = None,
         recordHarMode: HarMode = None,
         recordHarContent: HarContentPolicy = None,
+        clientCertificates: List[ClientCertificate] = None,
     ) -> BrowserContext:
         userDataDir = str(Path(userDataDir)) if userDataDir else ""
         params = locals_to_params(locals())
@@ -229,6 +231,13 @@ class BrowserType(ChannelOwner):
                     context._on_close()
                 browser._on_close()
             connection.cleanup(reason)
+            # TODO: Backport https://github.com/microsoft/playwright/commit/d8d5289e8692c9b1265d23ee66988d1ac5122f33
+            # Give a chance to any API call promises to reject upon page/context closure.
+            # This happens naturally when we receive page.onClose and browser.onClose from the server
+            # in separate tasks. However, upon pipe closure we used to dispatch them all synchronously
+            # here and promises did not have a chance to reject.
+            # The order of rejects vs closure is a part of the API contract and our test runner
+            # relies on it to attribute rejections to the right test.
 
         transport.once("close", handle_transport_close)
 

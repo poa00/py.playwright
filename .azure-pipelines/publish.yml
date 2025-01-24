@@ -33,13 +33,15 @@ extends:
         steps:
         - task: UsePythonVersion@0
           inputs:
-            versionSpec: '3.8'
+            versionSpec: '3.9'
           displayName: 'Use Python'
         - script: |
             python -m pip install --upgrade pip
             pip install -r local-requirements.txt
             pip install -e .
-            python setup.py bdist_wheel --all
+            for wheel in $(python setup.py --list-wheels); do
+              PLAYWRIGHT_TARGET_WHEEL=$wheel python -m build --wheel
+            done
           displayName: 'Install & Build'
         - task: EsrpRelease@7
           inputs:
